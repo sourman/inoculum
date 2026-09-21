@@ -1,5 +1,13 @@
 # inoculum
 
+1. Allows you to snapshot browser state and launch agents with FULL guts view using CDP
+2. Many commands to allow agents to use CDP efficiently tested on hundreds of agent runs across websites
+3. Meant for grokbot agents. The built-in browser lacks CDP and is slower for agents to navigate and automate
+
+Checkout github.com/sourman/wacdp for a good example of how this enabled automation in abrasive environs like whatsapp
+
+**AI slop below**
+_______________________________________________________________________________________________________________________
 **Grok Bot’s browser layer:** durable, per-agent Chromium with its own CDP port on the shared box.
 
 WhatsApp (and other sites) live in isolated profiles. Each bot gets a stable port in `9300–9499` and a color hashed from its identity. Pair with [wacdp](https://github.com/sourman/wacdp) for WhatsApp Web CDP verbs.
