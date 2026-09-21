@@ -1,0 +1,12 @@
+# Runtime state — never publish profiles or sessions
+profiles/
+run/
+logs/
+port-map
+base
+seeds/
+*.pid
+*.lock
+*.log
+.env
+*.env

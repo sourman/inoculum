@@ -1,0 +1,611 @@
+#!/usr/bin/env bash
+# inoculum — durable per-agent Chromium on the shared Grok Bot box.
+set -euo pipefail
+
+ROOT="${INOCULUM_ROOT:-/home/box/inoculum}"
+BASE="${INOCULUM_BASE:-$ROOT/base}"
+PROFILES="$ROOT/profiles"
+RUN="$ROOT/run"
+LOGS="$ROOT/logs"
+PORT_MAP="$ROOT/port-map"
+BASE_PORT=9299
+PORT_LO=9300
+PORT_HI=9499
+
+# Prefer /usr/bin/chromium
+if [[ -n "${INOCULUM_CHROMIUM:-}" ]]; then
+  CHROMIUM_BIN="$INOCULUM_CHROMIUM"
+elif [[ -x /usr/bin/chromium ]]; then
+  CHROMIUM_BIN=/usr/bin/chromium
+else
+  CHROMIUM_BIN=$(command -v chromium || command -v chromium-browser || true)
+fi
+
+die() { echo "inoculum: $*" >&2; exit 1; }
+
+ensure_dirs() {
+  mkdir -p "$PROFILES" "$RUN" "$LOGS"
+  [[ -f "$PORT_MAP" ]] || : >"$PORT_MAP"
+}
+
+default_key() {
+  if [[ -n "${INOCULUM_NAME:-}" ]]; then
+    printf '%s\n' "$INOCULUM_NAME"
+    return
+  fi
+  if [[ -n "${CURSOR_CONVERSATION_ID:-}" ]]; then
+    printf '%s\n' "$CURSOR_CONVERSATION_ID"
+    return
+  fi
+  die "no profile key — pass --name or set CURSOR_CONVERSATION_ID"
+}
+
+profile_dir() { printf '%s/%s\n' "$PROFILES" "$1"; }
+run_file()    { printf '%s/%s.env\n' "$RUN" "$1"; }
+pid_file()    { printf '%s/%s.pid\n' "$RUN" "$1"; }
+
+color_for() {
+  local h
+  h=$(printf '%s' "$1" | sha256sum | awk '{print $1}')
+  printf '#%s\n' "${h:0:6}"
+}
+
+# Stable port in 9300–9499 from key hash; persist in port-map; resolve collisions.
+port_for() {
+  local key="$1" existing h port i used
+  existing=$(awk -F'\t' -v k="$key" '$1==k{print $2; exit}' "$PORT_MAP" 2>/dev/null || true)
+  if [[ -n "$existing" ]]; then
+    printf '%s\n' "$existing"
+    return
+  fi
+  h=$(printf '%s' "$key" | sha256sum | awk '{print $1}')
+  port=$((0x${h:0:4} % 200 + PORT_LO))
+  for i in $(seq 0 199); do
+    used=$(awk -F'\t' -v p="$port" '$2==p{print 1; exit}' "$PORT_MAP" 2>/dev/null || true)
+    if [[ -z "$used" ]]; then
+      printf '%s\t%s\n' "$key" "$port" >>"$PORT_MAP"
+      printf '%s\n' "$port"
+      return
+    fi
+    port=$((PORT_LO + (port - PORT_LO + 1) % 200))
+  done
+  die "no free port in ${PORT_LO}–${PORT_HI}"
+}
+
+alive_pid() {
+  [[ -n "${1:-}" && -d "/proc/$1" ]] && kill -0 "$1" 2>/dev/null
+}
+
+cdp_ok() {
+  local p="${1:-}"
+  [[ -n "$p" ]] || return 1
+  curl -fsS --max-time 2 "http://127.0.0.1:${p}/json/version" >/dev/null 2>&1
+}
+
+clear_locks() {
+  local dest="$1"
+  [[ -d "$dest" ]] || return 0
+  rm -f "$dest"/SingletonLock "$dest"/SingletonSocket "$dest"/SingletonCookie \
+        "$dest"/DevToolsActivePort "$dest"/RunningChromeVersion
+}
+
+# Kill chromium whose cmdline contains --user-data-dir=<path> (not shell wrappers)
+pids_for_profile() {
+  local dest="$1"
+  local pid cmd
+  for pid in $(pgrep -f -- "--user-data-dir=${dest}" 2>/dev/null || true); do
+    cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    case "$cmd" in
+      */chromium*|--user-data-dir=*)
+        case "$cmd" in
+          *chromium*) printf '%s\n' "$pid" ;;
+        esac
+        ;;
+    esac
+  done
+}
+
+kill_by_profile() {
+  local dest="$1"
+  local pids pid i
+  pids=$(pids_for_profile "$dest")
+  [[ -z "$pids" ]] && { clear_locks "$dest"; return 0; }
+  for pid in $pids; do
+    kill "$pid" 2>/dev/null || true
+  done
+  for i in $(seq 1 50); do
+    pids=$(pids_for_profile "$dest")
+    [[ -z "$pids" ]] && break
+    sleep 0.1
+  done
+  pids=$(pids_for_profile "$dest")
+  if [[ -n "$pids" ]]; then
+    for pid in $pids; do
+      kill -9 "$pid" 2>/dev/null || true
+    done
+    sleep 0.2
+  fi
+  clear_locks "$dest"
+}
+
+seed_from_base() {
+  local key="$1" dest idb
+  dest=$(profile_dir "$key")
+  [[ -e "$BASE" ]] || die "base missing: $BASE"
+  if [[ -d "$dest/Default" ]]; then
+    idb=$(du -sb "$dest/Default/IndexedDB" 2>/dev/null | awk '{print $1}')
+    # Skip only when seed looks complete (>1MB IndexedDB). Empty/partial dirs re-seed.
+    if [[ -n "${idb:-}" && "$idb" -gt 1000000 ]]; then
+      return 0
+    fi
+    echo "inoculum: incomplete profile $key (IndexedDB=${idb:-0}) — re-seeding" >&2
+  fi
+  echo "inoculum: seeding $key ← $BASE" >&2
+  mkdir -p "$dest"
+  # Caller must stop base Chromium first or SingletonLock / partial copy risks QR logout.
+  rsync -a --delete \
+    --exclude=SingletonLock --exclude=SingletonSocket --exclude=SingletonCookie \
+    --exclude=DevToolsActivePort --exclude=RunningChromeVersion \
+    "$BASE"/ "$dest"/
+  clear_locks "$dest"
+}
+
+write_run() {
+  local key="$1" pid="$2" port="$3" dest="$4" throwaway="${5:-0}"
+  cat >"$(run_file "$key")" <<E
+KEY=$key
+PID=$pid
+PORT=$port
+PROFILE=$dest
+COLOR=$(color_for "$key")
+HTTP=http://127.0.0.1:$port
+THROWAWAY=$throwaway
+E
+  echo "$pid" >"$(pid_file "$key")"
+}
+
+launch_chromium() {
+  local key="$1" port="$2" dest="$3" url="${4:-}" throwaway="${5:-0}" headless="${6:-0}"
+  [[ -n "$CHROMIUM_BIN" && -x "$CHROMIUM_BIN" ]] || die "chromium not found (tried /usr/bin/chromium)"
+  clear_locks "$dest"
+  local args=(
+    --user-data-dir="$dest"
+    --remote-debugging-address=127.0.0.1
+    --remote-debugging-port="$port"
+    --no-first-run
+    --no-default-browser-check
+    --disable-dev-shm-usage
+    --password-store=basic
+    --hide-crash-restore-bubble
+    --no-sandbox
+    --enable-unsafe-swiftshader
+  )
+  if (( headless )); then
+    args+=(--headless=new --disable-gpu)
+  fi
+  if [[ -n "$url" ]]; then
+    args+=("$url")
+  else
+    args+=(--new-window)
+  fi
+  local log="$LOGS/${key}.log"
+  DISPLAY="${DISPLAY:-:3}" nohup "$CHROMIUM_BIN" "${args[@]}" >"$log" 2>&1 &
+  local pid=$!
+  write_run "$key" "$pid" "$port" "$dest" "$throwaway"
+  local i
+  for i in $(seq 1 80); do
+    if cdp_ok "$port"; then
+      echo "inoculum: up key=$key port=$port pid=$pid color=$(color_for "$key")"
+      echo "HTTP=http://127.0.0.1:$port"
+      echo "PROFILE=$dest"
+      return 0
+    fi
+    # Bail early if process died
+    if ! alive_pid "$pid"; then
+      die "chromium exited early (pid $pid) — see $log"
+    fi
+    sleep 0.25
+  done
+  die "CDP :$port never came up (pid $pid) — see $log"
+}
+
+# ---------------------------------------------------------------------------
+# Flag parsing (per-command; does not force a key unless need_key=1)
+# ---------------------------------------------------------------------------
+FLAG_NAME="" FLAG_HEADLESS=0 FLAG_THROWAWAY=0 FLAG_YES=0 FLAG_MINE=0 FLAG_URL="" FLAG_FROM=""
+
+parse_flags() {
+  FLAG_NAME="" FLAG_HEADLESS=0 FLAG_THROWAWAY=0 FLAG_YES=0 FLAG_MINE=0 FLAG_URL="" FLAG_FROM=""
+  local need_key="${1:-0}"
+  shift || true
+  local pos=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)       [[ $# -ge 2 ]] || die "--name needs a value"; FLAG_NAME="$2"; shift 2 ;;
+      --from)       [[ $# -ge 2 ]] || die "--from needs a value"; FLAG_FROM="$2"; shift 2 ;;
+      --headless)   FLAG_HEADLESS=1; shift ;;
+      --throwaway)  FLAG_THROWAWAY=1; shift ;;
+      --yes|-y)     FLAG_YES=1; shift ;;
+      --mine)       FLAG_MINE=1; shift ;;
+      -*)           die "unknown flag: $1" ;;
+      *)            pos+=("$1"); shift ;;
+    esac
+  done
+  ((${#pos[@]})) && FLAG_URL="${pos[0]}"
+  if (( need_key )); then
+    if [[ -z "$FLAG_NAME" ]]; then
+      FLAG_NAME=$(default_key)
+    fi
+  fi
+}
+
+cmd_up() {
+  ensure_dirs
+  parse_flags 1 "$@"
+  local key="$FLAG_NAME" port dest
+  port=$(port_for "$key")
+  dest=$(profile_dir "$key")
+
+  if [[ -f "$(run_file "$key")" ]]; then
+    # shellcheck disable=SC1090
+    source "$(run_file "$key")"
+    if cdp_ok "${PORT:-$port}"; then
+      echo "inoculum: already up key=$key port=$PORT (no-op)"
+      echo "HTTP=http://127.0.0.1:$PORT"
+      echo "PROFILE=${PROFILE:-$dest}"
+      return 0
+    fi
+    # Stale run file — clean up before relaunch
+    rm -f "$(run_file "$key")" "$(pid_file "$key")"
+  fi
+
+  # Also no-op if CDP already answering on assigned port (orphaned run metadata)
+  if cdp_ok "$port"; then
+    local alive_pid
+    alive_pid=$(pids_for_profile "$dest" | head -1 || true)
+    # Prefer browser main (no --type=)
+    local cand
+    for cand in $(pids_for_profile "$dest"); do
+      if tr '\0' ' ' <"/proc/$cand/cmdline" 2>/dev/null | grep -qv -- '--type='; then
+        alive_pid=$cand
+        break
+      fi
+    done
+    write_run "$key" "${alive_pid:-0}" "$port" "$dest" 0
+    echo "inoculum: already up key=$key port=$port (CDP alive, no-op)"
+    echo "HTTP=http://127.0.0.1:$port"
+    echo "PROFILE=$dest"
+    return 0
+  fi
+
+  if (( FLAG_THROWAWAY )); then
+    dest="$PROFILES/${key}.throwaway.$$"
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    rsync -a \
+      --exclude=SingletonLock --exclude=SingletonSocket --exclude=SingletonCookie \
+      --exclude=DevToolsActivePort --exclude=RunningChromeVersion \
+      "$BASE"/ "$dest"/
+    clear_locks "$dest"
+    launch_chromium "$key" "$port" "$dest" "$FLAG_URL" 1 "$FLAG_HEADLESS"
+    return
+  fi
+
+  seed_from_base "$key"
+  launch_chromium "$key" "$port" "$dest" "$FLAG_URL" 0 "$FLAG_HEADLESS"
+}
+
+cmd_down() {
+  ensure_dirs
+  parse_flags 1 "$@"
+  local key="$FLAG_NAME" pid="" throwaway=0 profile=""
+  profile=$(profile_dir "$key")
+  if [[ -f "$(run_file "$key")" ]]; then
+    # shellcheck disable=SC1090
+    source "$(run_file "$key")"
+    pid="${PID:-}"
+    throwaway="${THROWAWAY:-0}"
+    profile="${PROFILE:-$profile}"
+  fi
+  if [[ -f "$(pid_file "$key")" ]]; then
+    pid=$(cat "$(pid_file "$key")")
+  fi
+
+  if alive_pid "$pid"; then
+    kill "$pid" 2>/dev/null || true
+    local i
+    for i in $(seq 1 40); do
+      alive_pid "$pid" || break
+      sleep 0.1
+    done
+    alive_pid "$pid" && kill -9 "$pid" 2>/dev/null || true
+  fi
+  # Ensure all chromium using this profile are gone
+  kill_by_profile "$profile"
+  echo "inoculum: down key=$key (profile kept)"
+
+  if [[ "$throwaway" == "1" && -n "$profile" && -d "$profile" ]]; then
+    rm -rf "$profile"
+    echo "inoculum: throwaway profile removed"
+  fi
+  rm -f "$(run_file "$key")" "$(pid_file "$key")"
+}
+
+cmd_list() {
+  ensure_dirs
+  parse_flags 0 "$@"
+  local my=""
+  my=$(default_key 2>/dev/null || true)
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' KEY PORT COLOR STATE PID PROFILE
+  local d key port color state pid rf
+  shopt -s nullglob
+  for d in "$PROFILES"/*; do
+    [[ -d "$d" ]] || continue
+    key=$(basename "$d")
+    [[ "$key" == *.throwaway.* ]] && continue
+    if (( FLAG_MINE )); then
+      [[ -n "$my" && "$key" == "$my" ]] || continue
+    fi
+    port=$(awk -F'\t' -v k="$key" '$1==k{print $2; exit}' "$PORT_MAP" 2>/dev/null || true)
+    color=$(color_for "$key")
+    state=disk
+    pid=-
+    rf=$(run_file "$key")
+    if [[ -f "$rf" ]]; then
+      # shellcheck disable=SC1090
+      source "$rf"
+      port=${PORT:-$port}
+      pid=${PID:--}
+      if cdp_ok "${PORT:-0}"; then
+        state=running
+      elif alive_pid "${PID:-}"; then
+        state=process
+      else
+        state=stale
+      fi
+    elif [[ -n "$port" ]] && cdp_ok "$port"; then
+      state=running
+      pid=-
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$key" "${port:--}" "$color" "$state" "$pid" "$d"
+  done
+}
+
+cmd_eval() {
+  ensure_dirs
+  local key page=0 wait="" use_stdin=0 expression=""
+  key=$(default_key)
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)  [[ $# -ge 2 ]] || die "--name needs a value"; key="$2"; shift 2 ;;
+      --page)  page=1; shift ;;
+      --wait)  [[ $# -ge 2 ]] || die "--wait needs a value"; wait="$2"; shift 2 ;;
+      --stdin) use_stdin=1; shift ;;
+      -*)      die "unknown eval flag: $1" ;;
+      *)       expression="$1"; shift; break ;;
+    esac
+  done
+  (( use_stdin )) && expression=$(cat)
+  [[ -n "$expression" ]] || die "eval needs JS or --stdin"
+  [[ -f "$(run_file "$key")" ]] || die "not up: $key"
+  # shellcheck disable=SC1090
+  source "$(run_file "$key")"
+  cdp_ok "$PORT" || die "CDP dead on :$PORT"
+  python3 - "$HTTP" "$expression" "$wait" <<'PY'
+import json, sys, urllib.request, asyncio, subprocess
+http, expr, wait = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    import websockets
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", "websockets"])
+    import websockets
+
+tabs = json.load(urllib.request.urlopen(http.rstrip("/") + "/json/list"))
+pages = [t for t in tabs if t.get("type") == "page"]
+if not pages:
+    req = urllib.request.Request(http.rstrip("/") + "/json/new?about:blank", method="PUT")
+    pages = [json.load(urllib.request.urlopen(req))]
+# Prefer WhatsApp tab if present
+pages_sorted = sorted(pages, key=lambda t: (0 if "whatsapp" in (t.get("url") or "").lower() else 1))
+ws_url = pages_sorted[0]["webSocketDebuggerUrl"]
+
+async def main():
+    async with websockets.connect(ws_url, max_size=None) as ws:
+        nid = 1
+        async def call(method, params=None):
+            nonlocal nid
+            msg = {"id": nid, "method": method, "params": params or {}}
+            nid += 1
+            await ws.send(json.dumps(msg))
+            while True:
+                raw = json.loads(await asyncio.wait_for(ws.recv(), timeout=60))
+                if raw.get("id") == msg["id"]:
+                    if "error" in raw:
+                        raise RuntimeError(json.dumps(raw["error"]))
+                    return raw.get("result", {})
+        if wait:
+            await call("Runtime.evaluate", {
+                "expression": (
+                    "(async()=>{const t=Date.now();"
+                    "while(Date.now()-t<20000){try{if("+wait+")return true;}catch(e){}"
+                    "await new Promise(r=>setTimeout(r,150));}return false;})()"
+                ),
+                "awaitPromise": True,
+            })
+        exp = expr.strip()
+        wrapped = f"(async()=>{{ return ({exp}); }})()"
+        if exp.lstrip().startswith("return") or ";" in exp:
+            wrapped = f"(async()=>{{ {exp if 'return' in exp else exp+'; return true;'} }})()"
+        result = await call("Runtime.evaluate", {
+            "expression": wrapped,
+            "awaitPromise": True,
+            "returnByValue": True,
+            "userGesture": True,
+        })
+        val = result.get("result", {})
+        if val.get("subtype") == "error":
+            print(json.dumps({"error": val.get("description")}))
+            sys.exit(1)
+        print(json.dumps({"value": val.get("value"), "url": pages_sorted[0].get("url")}, default=str))
+
+asyncio.run(main())
+PY
+}
+
+cmd_reseed() {
+  ensure_dirs
+  parse_flags 1 "$@"
+  (( FLAG_YES )) || die "reseed requires --yes"
+  [[ -f "$(run_file "$FLAG_NAME")" ]] && die "still up — inoculum down first"
+  rm -rf "$(profile_dir "$FLAG_NAME")"
+  echo "inoculum: reseeded $FLAG_NAME (next up reclones base)"
+}
+
+cmd_rm_profile() {
+  ensure_dirs
+  parse_flags 1 "$@"
+  (( FLAG_YES )) || die "rm-profile requires --yes"
+  [[ -f "$(run_file "$FLAG_NAME")" ]] && die "still up — inoculum down first"
+  rm -rf "$(profile_dir "$FLAG_NAME")"
+  # Drop port-map entry
+  if [[ -f "$PORT_MAP" ]]; then
+    local tmp
+    tmp=$(mktemp)
+    awk -F'\t' -v k="$FLAG_NAME" '$1!=k{print}' "$PORT_MAP" >"$tmp"
+    mv "$tmp" "$PORT_MAP"
+  fi
+  echo "inoculum: removed $FLAG_NAME"
+}
+
+cmd_promote() {
+  ensure_dirs
+  parse_flags 0 "$@"
+  [[ -n "$FLAG_FROM" ]] || die "promote needs --from KEY"
+  (( FLAG_YES )) || die "promote needs --yes"
+  local src base_real bak
+  src=$(profile_dir "$FLAG_FROM")
+  [[ -d "$src" ]] || die "no profile $FLAG_FROM"
+  [[ -f "$(run_file "$FLAG_FROM")" ]] && die "source still up — inoculum down --name $FLAG_FROM first"
+  base_real=$(readlink -f "$BASE")
+  [[ -d "$base_real" ]] || die "base missing"
+  if [[ -e "$base_real/SingletonLock" ]] || [[ -n "$(pids_for_profile "$base_real")" ]]; then
+    die "base looks running — inoculum base down first"
+  fi
+  bak="${base_real}.bak.$(date +%s)"
+  echo "inoculum: promote $FLAG_FROM → base (backup $bak)" >&2
+  mv "$base_real" "$bak"
+  mkdir -p "$base_real"
+  rsync -a \
+    --exclude=SingletonLock --exclude=SingletonSocket --exclude=SingletonCookie \
+    --exclude=DevToolsActivePort --exclude=RunningChromeVersion \
+    "$src"/ "$base_real"/
+  clear_locks "$base_real"
+  # Ensure ROOT/base still points at chromium-cdp-profile path if it was a symlink
+  if [[ -L "$BASE" ]]; then
+    : # symlink intact; target recreated
+  fi
+  echo "inoculum: promote complete"
+}
+
+cmd_base() {
+  ensure_dirs
+  local sub="${1:-}"; shift || true
+  local base_real
+  base_real=$(readlink -f "$BASE" 2>/dev/null || true)
+  case "$sub" in
+    up)
+      [[ -d "$base_real" ]] || die "base missing"
+      if cdp_ok "$BASE_PORT"; then
+        echo "inoculum: base already up :$BASE_PORT"
+        echo "HTTP=http://127.0.0.1:$BASE_PORT"
+        return
+      fi
+      # If something still holds the profile on another port (e.g. 9222), refuse
+      if [[ -n "$(pids_for_profile "$base_real")" ]]; then
+        die "base profile already in use by another chromium — stop it first"
+      fi
+      clear_locks "$base_real"
+      [[ -n "$CHROMIUM_BIN" && -x "$CHROMIUM_BIN" ]] || die "chromium not found"
+      DISPLAY="${DISPLAY:-:3}" nohup "$CHROMIUM_BIN" \
+        --user-data-dir="$base_real" \
+        --remote-debugging-address=127.0.0.1 \
+        --remote-debugging-port="$BASE_PORT" \
+        --no-first-run --no-default-browser-check --disable-dev-shm-usage \
+        --password-store=basic --no-sandbox --enable-unsafe-swiftshader \
+        --hide-crash-restore-bubble \
+        --new-window >"$LOGS/base.log" 2>&1 &
+      echo $! >"$RUN/base.pid"
+      local i
+      for i in $(seq 1 80); do
+        cdp_ok "$BASE_PORT" && break
+        sleep 0.25
+      done
+      cdp_ok "$BASE_PORT" || die "base CDP failed — see $LOGS/base.log"
+      echo "inoculum: base up port=$BASE_PORT"
+      echo "HTTP=http://127.0.0.1:$BASE_PORT"
+      ;;
+    down)
+      if [[ -f "$RUN/base.pid" ]]; then
+        local bpid
+        bpid=$(cat "$RUN/base.pid")
+        kill "$bpid" 2>/dev/null || true
+        local i
+        for i in $(seq 1 40); do
+          alive_pid "$bpid" || break
+          sleep 0.1
+        done
+        alive_pid "$bpid" && kill -9 "$bpid" 2>/dev/null || true
+        rm -f "$RUN/base.pid"
+      fi
+      if [[ -n "$base_real" ]]; then
+        kill_by_profile "$base_real"
+      fi
+      # Also stop legacy CDP :9222 holders of the same profile
+      if [[ -n "$base_real" ]]; then
+        clear_locks "$base_real"
+      fi
+      echo "inoculum: base down"
+      ;;
+    *)
+      die "usage: inoculum base up|down"
+      ;;
+  esac
+}
+
+usage() {
+  cat <<'U'
+inoculum — durable per-agent Chromium on the shared box
+
+  inoculum up [--name KEY] [--headless] [--throwaway] [url]
+  inoculum down [--name KEY]
+  inoculum eval [--name KEY] [--page] [--wait 'js'] (--stdin | 'js')
+  inoculum list [--mine]
+  inoculum reseed [--name KEY] --yes
+  inoculum rm-profile [--name KEY] --yes
+  inoculum promote --from KEY --yes
+  inoculum base up|down
+
+Default KEY = CURSOR_CONVERSATION_ID (or INOCULUM_NAME / --name).
+Ports 9300–9499 (stable hash). Base CDP on 9299.
+Root = /home/box/inoculum  Base = /home/box/inoculum/base → chromium-cdp-profile
+Chromium = /usr/bin/chromium  DISPLAY default :3
+U
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    up)         cmd_up "$@" ;;
+    down)       cmd_down "$@" ;;
+    eval)       cmd_eval "$@" ;;
+    list)       cmd_list "$@" ;;
+    reseed)     cmd_reseed "$@" ;;
+    rm-profile) cmd_rm_profile "$@" ;;
+    promote)    cmd_promote "$@" ;;
+    base)       cmd_base "$@" ;;
+    -h|--help|help|"") usage ;;
+    *) die "unknown command: $cmd (try --help)" ;;
+  esac
+}
+
+main "$@"
