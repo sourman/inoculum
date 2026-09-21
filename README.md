@@ -41,7 +41,7 @@ Without inoculum (or an equivalent logged-in Chromium + CDP), a WhatsApp-gate bo
 git clone https://github.com/sourman/inoculum.git
 cd inoculum
 ./install.sh
-# puts CLI at ~/.local/bin/inoculum (alias: chad-browser)
+# puts CLI at ~/.local/bin/inoculum
 ```
 
 Env overrides:

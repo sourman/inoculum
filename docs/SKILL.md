@@ -4,8 +4,7 @@ description: >-
   WHEN to use: Grok Bot box needs isolated Chromium with durable per-agent
   profiles (CDP 9300–9499) so wacdp and other CDP drivers can attach. Prefer
   over headcrab for box launch; headcrab is personal-machine CDP only. Prefer
-  CDP for DOM/nav; computerUse for visual/SSO. Triggers: inoculum, chad-browser,
-  spin up browser, install Chromium, WA_CDP_HTTP, prepare CDP for wacdp.
+  CDP for DOM/nav; computerUse for visual/SSO. Triggers: inoculum, spin up browser, install Chromium, WA_CDP_HTTP, prepare CDP for wacdp.
 ---
 # inoculum
 
@@ -66,7 +65,7 @@ git clone https://github.com/sourman/inoculum.git /tmp/inoculum
 # or: copy this repo onto the box
 cd /tmp/inoculum
 ./install.sh
-# → ~/.local/bin/inoculum (+ chad-browser alias)
+# → ~/.local/bin/inoculum
 export PATH="$HOME/.local/bin:$PATH"
 inoculum 2>&1 | head -5   # should show usage, not "command not found"
 ```

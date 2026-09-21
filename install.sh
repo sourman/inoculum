@@ -5,7 +5,6 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 DEST="${INOCULUM_BIN:-$HOME/.local/bin}"
 mkdir -p "$DEST" "${INOCULUM_ROOT:-$HOME/inoculum}"/{profiles,run,logs}
 install -m 0755 "$ROOT/bin/inoculum" "$DEST/inoculum"
-ln -sfn "$DEST/inoculum" "$DEST/chad-browser" 2>/dev/null || true
 # Ensure DEST is on PATH for this shell hint
 case ":$PATH:" in
   *":$DEST:"*) ;;
