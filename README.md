@@ -6,6 +6,10 @@ WhatsApp (and other sites) live in isolated profiles. Each bot gets a stable por
 
 This is **not** a generic “headless Chrome launcher.” It assumes the Grok Bot box model: one machine, many agents, one `--user-data-dir` per process, CDP for DOM work, computerUse only when you need eyes/SSO.
 
+## Agent playbook
+
+If you are a Grok Bot (or any agent) setting this up: follow **[docs/SKILL.md](docs/SKILL.md)** end-to-end — install Chromium, install the CLI, `up` until CDP answers, then export `WA_CDP_HTTP` for [wacdp](https://github.com/sourman/wacdp). The skill is the source of truth for “make CDP ready.”
+
 ## Why it exists
 
 | Layer | Tool | Job |
